@@ -1,5 +1,6 @@
 //! Tauri commands invoked from the settings window's JavaScript frontend.
 
+use crate::config::WatchedFolder;
 use crate::state::AppState;
 use crate::watch::start_watching_folder;
 use serde::Serialize;
@@ -7,7 +8,7 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
-pub fn get_watched_folders(state: State<AppState>) -> Vec<String> {
+pub fn get_watched_folders(state: State<AppState>) -> Vec<WatchedFolder> {
     state.config.lock().unwrap().watched_folders.clone()
 }
 
@@ -46,24 +47,28 @@ pub fn add_watched_folder(
     state: State<AppState>,
     path: String,
 ) -> Result<(), String> {
+    let folder = WatchedFolder {
+        path: path.clone(),
+        excludes: Vec::new(),
+    };
     {
         let mut config = state.config.lock().unwrap();
-        if config.watched_folders.iter().any(|p| p == &path) {
+        if config.watched_folders.iter().any(|f| f.path == path) {
             return Ok(());
         }
-        config.watched_folders.push(path.clone());
+        config.watched_folders.push(folder.clone());
         config
             .save(&state.config_path)
             .map_err(|err| err.to_string())?;
     }
-    start_watching_folder(&app, &path)
+    start_watching_folder(&app, &folder)
 }
 
 #[tauri::command]
 pub fn remove_watched_folder(state: State<AppState>, path: String) -> Result<(), String> {
     {
         let mut config = state.config.lock().unwrap();
-        config.watched_folders.retain(|p| p != &path);
+        config.watched_folders.retain(|f| f.path != path);
         config
             .save(&state.config_path)
             .map_err(|err| err.to_string())?;
@@ -71,6 +76,30 @@ pub fn remove_watched_folder(state: State<AppState>, path: String) -> Result<(),
     // Dropping the watcher stops it.
     state.watchers.lock().unwrap().remove(&path);
     Ok(())
+}
+
+/// Updates a watched folder's custom exclude patterns and restarts its watcher so the
+/// new patterns take effect immediately (see [`start_watching_folder`]'s doc comment).
+#[tauri::command]
+pub fn set_folder_excludes(
+    app: AppHandle,
+    state: State<AppState>,
+    path: String,
+    excludes: Vec<String>,
+) -> Result<(), String> {
+    let folder = {
+        let mut config = state.config.lock().unwrap();
+        let Some(entry) = config.watched_folders.iter_mut().find(|f| f.path == path) else {
+            return Err(format!("{path} is not a watched folder"));
+        };
+        entry.excludes = excludes;
+        let folder = entry.clone();
+        config
+            .save(&state.config_path)
+            .map_err(|err| err.to_string())?;
+        folder
+    };
+    start_watching_folder(&app, &folder)
 }
 
 #[tauri::command]

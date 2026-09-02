@@ -1,5 +1,6 @@
 //! TCP transport for exchanging [`ChangeMessage`]s with peers on the LAN.
 
+use crate::outbox::Outbox;
 use crate::protocol::{ChangeMessage, SharedSecret};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -126,6 +127,47 @@ pub async fn broadcast(registry: &PeerRegistry, secret: &SharedSecret, msg: &Cha
     }
 }
 
+/// Like [`broadcast`], but for every peer in `known_peer_ids` (not just the ones
+/// currently online): a peer that's live in `registry` gets a direct send attempt, and
+/// anything not currently reachable — offline, or the direct send failed — is queued in
+/// `outbox` instead of being dropped, so it can be delivered once that peer is seen
+/// online again (see [`crate::roster::Roster`] for how `known_peer_ids` stays populated
+/// with offline peers, and the discovery-triggered flush that drains `outbox`).
+pub async fn broadcast_with_outbox(
+    registry: &PeerRegistry,
+    outbox: &Outbox,
+    known_peer_ids: &[String],
+    secret: &SharedSecret,
+    msg: &ChangeMessage,
+) {
+    let live: HashMap<String, SocketAddr> = registry
+        .handles()
+        .into_iter()
+        .map(|h| (h.peer_id, h.addr))
+        .collect();
+
+    for peer_id in known_peer_ids {
+        if peer_id == &msg.peer_id {
+            continue; // never queue a message to ourselves
+        }
+        let delivered = match live.get(peer_id) {
+            Some(&addr) => match msg.send_to(addr, secret).await {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(%peer_id, ?addr, ?err, "failed to send to a currently-online peer");
+                    false
+                }
+            },
+            None => false,
+        };
+        if !delivered {
+            if let Err(err) = outbox.enqueue(peer_id, msg) {
+                warn!(%peer_id, ?err, "failed to queue change message for offline peer");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +233,94 @@ mod tests {
             result.is_err(),
             "message signed with the wrong secret must be dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_outbox_delivers_directly_to_online_peers() {
+        let secret = SharedSecret::new("test-secret");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (local_addr, _handle) = run_peer_server(bind_addr, secret.clone(), tx)
+            .await
+            .unwrap();
+
+        let registry = PeerRegistry::new();
+        registry.upsert("peer-online", "laptop", local_addr);
+
+        let outbox_dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(outbox_dir.path().to_path_buf());
+
+        let msg = ChangeMessage {
+            peer_id: "sender".into(),
+            hostname: "desktop".into(),
+            path: "notes.txt".into(),
+            kind: ChangeKind::Modified,
+            timestamp: Utc::now(),
+        };
+        broadcast_with_outbox(
+            &registry,
+            &outbox,
+            &["peer-online".to_string()],
+            &secret,
+            &msg,
+        )
+        .await;
+
+        let received = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+        assert_eq!(received, msg);
+        assert!(
+            outbox.pending("peer-online").unwrap().is_empty(),
+            "a peer reachable at broadcast time should not go through the outbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_outbox_queues_for_offline_peers() {
+        let secret = SharedSecret::new("test-secret");
+        let registry = PeerRegistry::new(); // empty: no peer is currently online
+
+        let outbox_dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(outbox_dir.path().to_path_buf());
+
+        let msg = ChangeMessage {
+            peer_id: "sender".into(),
+            hostname: "desktop".into(),
+            path: "notes.txt".into(),
+            kind: ChangeKind::Modified,
+            timestamp: Utc::now(),
+        };
+        broadcast_with_outbox(
+            &registry,
+            &outbox,
+            &["peer-offline".to_string()],
+            &secret,
+            &msg,
+        )
+        .await;
+
+        let pending = outbox.pending("peer-offline").unwrap();
+        assert_eq!(pending, vec![msg]);
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_outbox_never_queues_a_message_to_its_own_sender() {
+        let secret = SharedSecret::new("test-secret");
+        let registry = PeerRegistry::new();
+        let outbox_dir = tempfile::tempdir().unwrap();
+        let outbox = Outbox::open(outbox_dir.path().to_path_buf());
+
+        let msg = ChangeMessage {
+            peer_id: "self".into(),
+            hostname: "desktop".into(),
+            path: "notes.txt".into(),
+            kind: ChangeKind::Modified,
+            timestamp: Utc::now(),
+        };
+        broadcast_with_outbox(&registry, &outbox, &["self".to_string()], &secret, &msg).await;
+
+        assert!(outbox.pending("self").unwrap().is_empty());
     }
 }

@@ -5,10 +5,12 @@
 //! reported once watching resumes — see that module's docs for what this does and
 //! doesn't cover.
 
+use crate::config::WatchedFolder;
 use crate::notify_toast::show_change_toast;
 use crate::state::AppState;
 use lfsync_core::{
-    broadcast, ChangeEvent, ChangeMessage, ExcludeRules, FolderWatcher, ManifestStore, SharedSecret,
+    broadcast_with_outbox, ChangeEvent, ChangeMessage, ExcludeRules, FolderWatcher, ManifestStore,
+    SharedSecret,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -24,14 +26,18 @@ const DEBOUNCE: Duration = Duration::from_millis(800);
 /// Starts watching `folder`, registering the watcher in [`AppState::watchers`] and
 /// spawning a task that broadcasts each detected change to known peers and shows a
 /// local toast confirming it was picked up.
-pub fn start_watching_folder(app: &AppHandle, folder: &str) -> Result<(), String> {
-    let root = PathBuf::from(folder);
-    let excludes = ExcludeRules::default();
-    let manifest_path = crate::config::manifests_dir().join(manifest_filename(folder));
+///
+/// Safe to call again for a folder that's already being watched (e.g. after its exclude
+/// patterns changed): inserting into `AppState::watchers` under the same key drops the
+/// previous `FolderWatcher`, which stops it and lets the new one take over.
+pub fn start_watching_folder(app: &AppHandle, folder: &WatchedFolder) -> Result<(), String> {
+    let root = PathBuf::from(&folder.path);
+    let excludes = ExcludeRules::new(folder.excludes.clone());
+    let manifest_path = crate::config::manifests_dir().join(manifest_filename(&folder.path));
     let (store, catchup_events) = ManifestStore::open(root.clone(), manifest_path, &excludes);
     if !catchup_events.is_empty() {
         tracing::info!(
-            folder,
+            folder = %folder.path,
             count = catchup_events.len(),
             "found changes made while this folder wasn't being watched"
         );
@@ -44,7 +50,7 @@ pub fn start_watching_folder(app: &AppHandle, folder: &str) -> Result<(), String
         .watchers
         .lock()
         .unwrap()
-        .insert(folder.to_string(), watcher);
+        .insert(folder.path.clone(), watcher);
 
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -80,10 +86,15 @@ async fn forward_changes(
         report_change(&app, &root, &event).await;
         store.record(&event);
     }
+
+    // The channel closed because the folder's `FolderWatcher` was dropped (folder
+    // removed, or its watcher restarted with new excludes) — persist anything `record`
+    // was still throttling so it isn't lost.
+    store.flush();
 }
 
 async fn report_change(app: &AppHandle, root: &Path, event: &ChangeEvent) {
-    let (peer_id, hostname, shared_secret, peer_registry) = {
+    let (peer_id, hostname, shared_secret, peer_registry, outbox, known_peer_ids) = {
         let state = app.state::<AppState>();
         let config = state.config.lock().unwrap();
         (
@@ -91,6 +102,8 @@ async fn report_change(app: &AppHandle, root: &Path, event: &ChangeEvent) {
             state.hostname.clone(),
             SharedSecret::new(&config.shared_secret),
             state.peer_registry.clone(),
+            state.outbox.clone(),
+            state.roster.peer_ids(),
         )
     };
 
@@ -103,7 +116,14 @@ async fn report_change(app: &AppHandle, root: &Path, event: &ChangeEvent) {
         timestamp: chrono::Utc::now(),
     };
 
-    broadcast(&peer_registry, &shared_secret, &msg).await;
+    broadcast_with_outbox(
+        &peer_registry,
+        &outbox,
+        &known_peer_ids,
+        &shared_secret,
+        &msg,
+    )
+    .await;
     show_change_toast(app, "このPC", &display_path, event.kind);
 }
 

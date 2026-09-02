@@ -17,20 +17,49 @@ async function refreshFolders() {
 
   for (const folder of folders) {
     const li = document.createElement("li");
+    li.className = "folder-row";
+
+    const topRow = document.createElement("div");
+    topRow.className = "folder-row-line";
 
     const path = document.createElement("span");
     path.className = "path";
-    path.textContent = folder;
+    path.textContent = folder.path;
 
     const removeBtn = document.createElement("button");
     removeBtn.className = "secondary";
     removeBtn.textContent = "削除";
     removeBtn.addEventListener("click", async () => {
-      await invoke("remove_watched_folder", { path: folder });
+      await invoke("remove_watched_folder", { path: folder.path });
       await refreshFolders();
     });
 
-    li.append(path, removeBtn);
+    topRow.append(path, removeBtn);
+
+    const bottomRow = document.createElement("div");
+    bottomRow.className = "folder-row-line";
+
+    const excludesInput = document.createElement("input");
+    excludesInput.type = "text";
+    excludesInput.className = "excludes-input";
+    excludesInput.placeholder = "除外パターン(カンマ区切り、例: drafts, *.bak)";
+    excludesInput.value = folder.excludes.join(", ");
+
+    const applyBtn = document.createElement("button");
+    applyBtn.className = "neutral";
+    applyBtn.textContent = "適用";
+    applyBtn.addEventListener("click", async () => {
+      const excludes = excludesInput.value
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      await invoke("set_folder_excludes", { path: folder.path, excludes });
+      await refreshFolders();
+    });
+
+    bottomRow.append(excludesInput, applyBtn);
+
+    li.append(topRow, bottomRow);
     folderList.append(li);
   }
 }

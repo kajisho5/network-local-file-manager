@@ -8,7 +8,10 @@ mod state;
 mod watch;
 
 use config::{config_path, Config};
-use lfsync_core::{run_peer_server, ChangeMessage, PeerRegistry, SharedSecret, DEFAULT_PORT};
+use lfsync_core::{
+    run_peer_server, ChangeMessage, Outbox, PeerHandle, PeerRegistry, Roster, SharedSecret,
+    DEFAULT_PORT,
+};
 use state::AppState;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -27,6 +30,8 @@ fn main() {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "unknown-pc".to_string());
     let peer_registry = PeerRegistry::new();
+    let roster = Roster::load(config::roster_path());
+    let outbox = Outbox::open(config::outbox_dir());
 
     let app_state = AppState {
         config_path: path,
@@ -34,6 +39,8 @@ fn main() {
         peer_registry: peer_registry.clone(),
         watchers: Mutex::new(HashMap::new()),
         hostname: hostname.clone(),
+        roster: roster.clone(),
+        outbox: outbox.clone(),
     };
 
     tauri::Builder::default()
@@ -48,6 +55,7 @@ fn main() {
             commands::pick_folder,
             commands::get_shared_secret,
             commands::set_shared_secret,
+            commands::set_folder_excludes,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -61,6 +69,8 @@ fn main() {
             };
             let hostname_for_discovery = hostname.clone();
             let registry_for_task = peer_registry.clone();
+            let roster_for_task = roster.clone();
+            let outbox_for_task = outbox.clone();
 
             tauri::async_runtime::spawn(async move {
                 run_agent_networking(
@@ -68,6 +78,8 @@ fn main() {
                     peer_id,
                     hostname_for_discovery,
                     registry_for_task,
+                    roster_for_task,
+                    outbox_for_task,
                     shared_secret,
                 )
                 .await;
@@ -82,7 +94,7 @@ fn main() {
                 .clone();
             for folder in folders {
                 if let Err(err) = watch::start_watching_folder(app.handle(), &folder) {
-                    tracing::error!(%folder, %err, "failed to start watching folder");
+                    tracing::error!(folder = %folder.path, %err, "failed to start watching folder");
                 }
             }
 
@@ -102,8 +114,10 @@ fn main() {
         .expect("error while running tauri application");
 }
 
-/// Binds the peer TCP server, starts mDNS discovery/advertisement, and shows a toast for
-/// every change received from a peer. Runs for the lifetime of the app.
+/// Binds the peer TCP server, starts mDNS discovery/advertisement, shows a toast for
+/// every change received from a peer, and flushes `outbox` for a peer the moment it's
+/// (re)discovered on the LAN — see `lfsync_core::outbox` for what that does and doesn't
+/// cover. Runs for the lifetime of the app.
 ///
 /// `shared_secret` is captured once at startup: if the user changes it later via the
 /// settings window, this server keeps validating incoming messages against the old value
@@ -114,8 +128,15 @@ async fn run_agent_networking(
     peer_id: String,
     hostname: String,
     registry: PeerRegistry,
+    roster: Roster,
+    outbox: Outbox,
     shared_secret: SharedSecret,
 ) {
+    // Taken before the peer server setup below, which may move `shared_secret` down one
+    // of two branches — this clone stays valid for the outbox-flush task regardless of
+    // which branch runs.
+    let flush_secret = shared_secret.clone();
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChangeMessage>();
 
     let default_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
@@ -137,15 +158,64 @@ async fn run_agent_networking(
         }
     };
 
+    let (peer_online_tx, mut peer_online_rx) = tokio::sync::mpsc::unbounded_channel::<PeerHandle>();
+
     // Keep the daemon alive for as long as the app runs by leaking it into this task's
     // scope: dropping it would stop advertising/browsing.
-    match lfsync_core::start_discovery(peer_id, hostname, local_addr.port(), registry) {
+    match lfsync_core::start_discovery(
+        peer_id,
+        hostname,
+        local_addr.port(),
+        registry,
+        roster,
+        peer_online_tx,
+    ) {
         Ok(daemon) => std::mem::forget(daemon),
         Err(err) => tracing::error!(?err, "failed to start mDNS discovery"),
     }
 
+    tauri::async_runtime::spawn(async move {
+        while let Some(peer) = peer_online_rx.recv().await {
+            flush_outbox_for(&peer, &outbox, &flush_secret).await;
+        }
+    });
+
     while let Some(msg) = rx.recv().await {
         notify_toast::show_change_toast(&app, &msg.hostname, &msg.path, msg.kind);
+    }
+}
+
+/// Delivers everything queued in `outbox` for `peer`, in order, stopping at the first
+/// failed send so a gap doesn't get acknowledged as delivered.
+async fn flush_outbox_for(peer: &PeerHandle, outbox: &Outbox, secret: &SharedSecret) {
+    let pending = match outbox.pending(&peer.peer_id) {
+        Ok(pending) => pending,
+        Err(err) => {
+            tracing::warn!(?err, peer = %peer.hostname, "failed to read outbox for peer");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut delivered = 0;
+    for msg in &pending {
+        match msg.send_to(peer.addr, secret).await {
+            Ok(()) => delivered += 1,
+            Err(err) => {
+                tracing::warn!(?err, peer = %peer.hostname, "failed to flush a queued change to peer");
+                break;
+            }
+        }
+    }
+
+    if delivered > 0 {
+        if let Err(err) = outbox.acknowledge(&peer.peer_id, delivered) {
+            tracing::warn!(?err, peer = %peer.hostname, "failed to acknowledge flushed outbox entries");
+        } else {
+            tracing::info!(peer = %peer.hostname, delivered, "delivered queued changes to a peer that came back online");
+        }
     }
 }
 

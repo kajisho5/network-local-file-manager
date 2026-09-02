@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// A lightweight fingerprint of one file, cheap enough to keep for every file in a
 /// watched tree without hashing file contents.
@@ -117,12 +117,24 @@ fn diff(root: &Path, old: &Manifest, new: &Manifest) -> Vec<ChangeEvent> {
     events
 }
 
+/// Minimum time between two disk writes triggered by [`ManifestStore::record`]. A change
+/// is always reflected in memory immediately; this only throttles how often that gets
+/// persisted, so a folder with frequent activity (logs, build output, ...) doesn't turn
+/// every single change into a disk write.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+struct ManifestState {
+    manifest: Manifest,
+    dirty: bool,
+    last_flush: Instant,
+}
+
 /// Keeps a watched folder's on-disk manifest in sync with reality, so that a restart can
 /// tell what changed while the agent was down.
 pub struct ManifestStore {
     root: PathBuf,
     manifest_path: PathBuf,
-    manifest: Mutex<Manifest>,
+    state: Mutex<ManifestState>,
 }
 
 impl ManifestStore {
@@ -156,27 +168,36 @@ impl ManifestStore {
         let store = Self {
             root,
             manifest_path,
-            manifest: Mutex::new(fresh),
+            state: Mutex::new(ManifestState {
+                manifest: fresh,
+                dirty: false,
+                last_flush: Instant::now(),
+            }),
         };
         (store, events)
     }
 
-    /// Updates the manifest for one change already reported by the live watcher, and
-    /// persists it — so a later restart's catch-up scan doesn't re-report it.
+    /// Updates the manifest for one change already reported by the live watcher.
+    ///
+    /// Always applied in memory immediately; persisted to disk only if at least
+    /// [`FLUSH_INTERVAL`] has passed since the last write — call [`Self::flush`] to force
+    /// a write regardless (e.g. when the folder stops being watched), so a burst of
+    /// changes right before that point isn't lost.
     pub fn record(&self, event: &ChangeEvent) {
         let Ok(relative) = event.path.strip_prefix(&self.root) else {
             return;
         };
         let key = relative.to_string_lossy().replace('\\', "/");
 
-        let mut manifest = self.manifest.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         match event.kind {
             ChangeKind::Removed => {
-                manifest.entries.remove(&key);
+                state.manifest.entries.remove(&key);
             }
             _ => match std::fs::metadata(&event.path) {
                 Ok(metadata) if metadata.is_file() => {
-                    manifest
+                    state
+                        .manifest
                         .entries
                         .insert(key, FileStamp::from_metadata(&metadata));
                 }
@@ -185,10 +206,30 @@ impl ManifestStore {
                 _ => return,
             },
         }
+        state.dirty = true;
 
-        if let Err(err) = manifest.save(&self.manifest_path) {
-            tracing::warn!(?err, "failed to persist manifest update");
+        if state.last_flush.elapsed() >= FLUSH_INTERVAL {
+            self.flush_locked(&mut state);
         }
+    }
+
+    /// Persists the in-memory manifest to disk if it has unsaved changes, regardless of
+    /// how recently the last write happened.
+    pub fn flush(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.flush_locked(&mut state);
+    }
+
+    fn flush_locked(&self, state: &mut ManifestState) {
+        if !state.dirty {
+            return;
+        }
+        if let Err(err) = state.manifest.save(&self.manifest_path) {
+            tracing::warn!(?err, "failed to persist manifest update");
+            return;
+        }
+        state.dirty = false;
+        state.last_flush = Instant::now();
     }
 }
 
@@ -258,19 +299,57 @@ mod tests {
         );
         assert!(events.is_empty());
 
-        // A live watcher would report this and call `record` for it.
+        // A live watcher would report this and call `record` for it, then `flush` when
+        // watching stops (see the throttling test below for what happens without it).
         let new_path = root.join("live_change.txt");
         fs::write(&new_path, b"created while watching").unwrap();
         store.record(&ChangeEvent {
             path: new_path,
             kind: ChangeKind::Created,
         });
+        store.flush();
         drop(store);
 
         let (_store, events) = ManifestStore::open(root, manifest_path, &ExcludeRules::default());
         assert!(
             events.is_empty(),
             "a change already recorded live must not resurface as a catch-up event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn record_throttles_disk_writes_until_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        let root = dir.path().join("watched");
+        fs::create_dir(&root).unwrap();
+
+        let (store, _events) = ManifestStore::open(
+            root.clone(),
+            manifest_path.clone(),
+            &ExcludeRules::default(),
+        );
+        let baseline_contents = fs::read_to_string(&manifest_path).unwrap();
+
+        // `open` just set `last_flush` to "now", so this `record` is guaranteed to land
+        // inside the throttle window — the on-disk manifest must not change yet.
+        let new_path = root.join("new.txt");
+        fs::write(&new_path, b"hello").unwrap();
+        store.record(&ChangeEvent {
+            path: new_path,
+            kind: ChangeKind::Created,
+        });
+        assert_eq!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            baseline_contents,
+            "record() must not write to disk before the flush interval has elapsed"
+        );
+
+        store.flush();
+        assert_ne!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            baseline_contents,
+            "flush() must persist the pending in-memory change"
         );
     }
 }

@@ -1,9 +1,19 @@
-//! Persisted user settings: which folders to watch, this machine's stable peer id, and
-//! the shared secret used to authenticate change messages with other agents.
+//! Persisted user settings: which folders to watch (and their per-folder exclude
+//! patterns), this machine's stable peer id, and the shared secret used to authenticate
+//! change messages with other agents.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// A folder being watched, plus any extra names/suffixes to ignore inside it (on top of
+/// the built-in defaults in `lfsync_core::ExcludeRules` — `.git`, `node_modules`, etc.).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchedFolder {
+    pub path: String,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -13,7 +23,8 @@ pub struct Config {
     /// set it once on each machine via the settings window, like a Wi-Fi password.
     #[serde(default = "generate_secret")]
     pub shared_secret: String,
-    pub watched_folders: Vec<String>,
+    #[serde(deserialize_with = "deserialize_watched_folders")]
+    pub watched_folders: Vec<WatchedFolder>,
 }
 
 impl Default for Config {
@@ -31,6 +42,33 @@ impl Default for Config {
 /// crate just for this.
 fn generate_secret() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+/// Accepts `watched_folders` in either shape: the pre-exclude-UI format (a plain array of
+/// path strings) or the current `{path, excludes}` object array, normalizing both into
+/// `Vec<WatchedFolder>` so old config files on disk keep working after this upgrade.
+fn deserialize_watched_folders<'de, D>(deserializer: D) -> Result<Vec<WatchedFolder>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FolderEntry {
+        Path(String),
+        Full(WatchedFolder),
+    }
+
+    let entries = Vec::<FolderEntry>::deserialize(deserializer)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| match entry {
+            FolderEntry::Path(path) => WatchedFolder {
+                path,
+                excludes: Vec::new(),
+            },
+            FolderEntry::Full(folder) => folder,
+        })
+        .collect())
 }
 
 impl Config {
@@ -67,6 +105,22 @@ pub fn manifests_dir() -> PathBuf {
         .join("manifests")
 }
 
+/// Directory where per-peer outbound message queues are kept (see [`lfsync_core::Outbox`]).
+pub fn outbox_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("network-local-file-manager")
+        .join("outbox")
+}
+
+/// File tracking every peer ever discovered on the LAN (see [`lfsync_core::Roster`]).
+pub fn roster_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("network-local-file-manager")
+        .join("roster.json")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,9 +131,10 @@ mod tests {
         let path = dir.path().join("config.json");
 
         let mut config = Config::default();
-        config
-            .watched_folders
-            .push("/home/alice/Documents".to_string());
+        config.watched_folders.push(WatchedFolder {
+            path: "/home/alice/Documents".to_string(),
+            excludes: vec!["drafts".to_string()],
+        });
         config.save(&path).unwrap();
 
         let loaded = Config::load(&path);
@@ -106,10 +161,62 @@ mod tests {
 
         let config = Config::load(&path);
         assert_eq!(config.peer_id, "abc");
-        assert_eq!(config.watched_folders, vec!["/tmp/x".to_string()]);
+        assert_eq!(
+            config.watched_folders,
+            vec![WatchedFolder {
+                path: "/tmp/x".to_string(),
+                excludes: Vec::new()
+            }]
+        );
         assert!(
             !config.shared_secret.is_empty(),
             "must backfill a secret for pre-existing configs"
+        );
+    }
+
+    #[test]
+    fn old_plain_string_watched_folders_migrate_to_the_object_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"peer_id":"abc","shared_secret":"s","watched_folders":["/tmp/a","/tmp/b"]}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&path);
+        assert_eq!(
+            config.watched_folders,
+            vec![
+                WatchedFolder {
+                    path: "/tmp/a".to_string(),
+                    excludes: Vec::new()
+                },
+                WatchedFolder {
+                    path: "/tmp/b".to_string(),
+                    excludes: Vec::new()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn new_object_shape_watched_folders_round_trip_with_excludes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"peer_id":"abc","shared_secret":"s","watched_folders":[{"path":"/tmp/a","excludes":["drafts","*.bak"]}]}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&path);
+        assert_eq!(
+            config.watched_folders,
+            vec![WatchedFolder {
+                path: "/tmp/a".to_string(),
+                excludes: vec!["drafts".to_string(), "*.bak".to_string()],
+            }]
         );
     }
 }
