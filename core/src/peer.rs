@@ -1,6 +1,6 @@
 //! TCP transport for exchanging [`ChangeMessage`]s with peers on the LAN.
 
-use crate::protocol::ChangeMessage;
+use crate::protocol::{ChangeMessage, SharedSecret};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -77,6 +77,7 @@ impl PeerRegistry {
 /// Runs until the returned `JoinHandle` is aborted or the process exits.
 pub async fn run_peer_server(
     bind_addr: SocketAddr,
+    secret: SharedSecret,
     sender: mpsc::UnboundedSender<ChangeMessage>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind_addr).await?;
@@ -92,13 +93,17 @@ pub async fn run_peer_server(
                 }
             };
             let sender = sender.clone();
+            let secret = secret.clone();
             tokio::spawn(async move {
-                match ChangeMessage::read_from(&mut stream).await {
+                match ChangeMessage::read_from(&mut stream, &secret).await {
                     Ok(msg) => {
                         debug!(?peer_addr, ?msg, "received change message");
                         let _ = sender.send(msg);
                     }
                     Err(err) => {
+                        // A verification failure here is expected background noise once
+                        // more than one shared secret is in use on the LAN (e.g. someone
+                        // else's instance of this app) — not necessarily an attack.
                         warn!(?peer_addr, ?err, "failed to read change message");
                     }
                 }
@@ -113,9 +118,9 @@ pub async fn run_peer_server(
 ///
 /// Best-effort: a peer that is offline or unreachable is skipped without failing the
 /// whole broadcast, since LAN peers routinely come and go.
-pub async fn broadcast(registry: &PeerRegistry, msg: &ChangeMessage) {
+pub async fn broadcast(registry: &PeerRegistry, secret: &SharedSecret, msg: &ChangeMessage) {
     for addr in registry.addrs() {
-        if let Err(err) = msg.send_to(addr).await {
+        if let Err(err) = msg.send_to(addr, secret).await {
             warn!(?addr, ?err, "failed to send change message to peer");
         }
     }
@@ -132,9 +137,12 @@ mod tests {
 
     #[tokio::test]
     async fn server_forwards_received_message() {
+        let secret = SharedSecret::new("test-secret");
         let (tx, mut rx) = mpsc::unbounded_channel();
         let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let (local_addr, _handle) = run_peer_server(bind_addr, tx).await.unwrap();
+        let (local_addr, _handle) = run_peer_server(bind_addr, secret.clone(), tx)
+            .await
+            .unwrap();
 
         let registry = PeerRegistry::new();
         registry.upsert("peer-a", "laptop", local_addr);
@@ -146,7 +154,7 @@ mod tests {
             kind: ChangeKind::Modified,
             timestamp: Utc::now(),
         };
-        broadcast(&registry, &msg).await;
+        broadcast(&registry, &secret, &msg).await;
 
         let received = timeout(Duration::from_secs(5), rx.recv())
             .await
@@ -154,5 +162,34 @@ mod tests {
             .expect("channel closed");
 
         assert_eq!(received, msg);
+    }
+
+    #[tokio::test]
+    async fn server_drops_message_with_wrong_secret() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (local_addr, _handle) =
+            run_peer_server(bind_addr, SharedSecret::new("server-secret"), tx)
+                .await
+                .unwrap();
+
+        let registry = PeerRegistry::new();
+        registry.upsert("peer-a", "laptop", local_addr);
+
+        let msg = ChangeMessage {
+            peer_id: "peer-a".into(),
+            hostname: "laptop".into(),
+            path: "notes.txt".into(),
+            kind: ChangeKind::Modified,
+            timestamp: Utc::now(),
+        };
+        broadcast(&registry, &SharedSecret::new("attacker-secret"), &msg).await;
+
+        // Give the server a moment to reject the connection, then confirm nothing arrived.
+        let result = timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "message signed with the wrong secret must be dropped"
+        );
     }
 }

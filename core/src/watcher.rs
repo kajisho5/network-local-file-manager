@@ -1,5 +1,6 @@
 //! Recursive folder watching with debouncing, built on top of the `notify` crate.
 
+use crate::exclude::ExcludeRules;
 use crate::protocol::ChangeKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ impl FolderWatcher {
     pub fn watch(
         root: impl AsRef<Path>,
         debounce: Duration,
+        excludes: ExcludeRules,
         sender: mpsc::UnboundedSender<ChangeEvent>,
     ) -> notify::Result<Self> {
         let (std_tx, std_rx) = std_mpsc::channel::<notify::Result<Event>>();
@@ -34,7 +36,7 @@ impl FolderWatcher {
         })?;
         watcher.watch(root.as_ref(), RecursiveMode::Recursive)?;
 
-        std::thread::spawn(move || debounce_loop(std_rx, debounce, sender));
+        std::thread::spawn(move || debounce_loop(std_rx, debounce, excludes, sender));
 
         Ok(Self { _watcher: watcher })
     }
@@ -47,6 +49,7 @@ impl FolderWatcher {
 fn debounce_loop(
     std_rx: std_mpsc::Receiver<notify::Result<Event>>,
     debounce: Duration,
+    excludes: ExcludeRules,
     sender: mpsc::UnboundedSender<ChangeEvent>,
 ) {
     let mut pending: HashMap<PathBuf, (ChangeKind, Instant)> = HashMap::new();
@@ -57,6 +60,9 @@ fn debounce_loop(
                 if let Some(kind) = classify(&event.kind) {
                     let now = Instant::now();
                     for path in event.paths {
+                        if excludes.is_excluded(&path) {
+                            continue;
+                        }
                         pending
                             .entry(path)
                             .and_modify(|(existing, seen_at)| {
@@ -136,7 +142,13 @@ mod tests {
     async fn detects_file_creation() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = FolderWatcher::watch(dir.path(), StdDuration::from_millis(200), tx).unwrap();
+        let _watcher = FolderWatcher::watch(
+            dir.path(),
+            StdDuration::from_millis(200),
+            ExcludeRules::default(),
+            tx,
+        )
+        .unwrap();
 
         // give the watcher time to register before we touch the filesystem
         tokio::time::sleep(StdDuration::from_millis(200)).await;
@@ -160,7 +172,13 @@ mod tests {
         fs::write(&file_path, b"original").unwrap();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = FolderWatcher::watch(dir.path(), StdDuration::from_millis(200), tx).unwrap();
+        let _watcher = FolderWatcher::watch(
+            dir.path(),
+            StdDuration::from_millis(200),
+            ExcludeRules::default(),
+            tx,
+        )
+        .unwrap();
         tokio::time::sleep(StdDuration::from_millis(200)).await;
 
         // Simulate an atomic "replace" save: write to a temp file, then rename over the
@@ -184,5 +202,38 @@ mod tests {
         .expect("timed out waiting for change event on destination path");
 
         assert_eq!(event.kind, ChangeKind::Modified);
+    }
+
+    #[tokio::test]
+    async fn ignores_excluded_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = FolderWatcher::watch(
+            dir.path(),
+            StdDuration::from_millis(200),
+            ExcludeRules::default(),
+            tx,
+        )
+        .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+
+        // A change inside .git should never surface...
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main").unwrap();
+        // ...but a normal file still should, proving the watcher itself is still alive.
+        let visible_path = dir.path().join("notes.txt");
+        fs::write(&visible_path, b"hello").unwrap();
+
+        let event = timeout(StdDuration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for change event")
+            .expect("channel closed unexpectedly");
+
+        assert_eq!(
+            event.path, visible_path,
+            "excluded .git change leaked through"
+        );
     }
 }

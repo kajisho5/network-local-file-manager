@@ -25,6 +25,18 @@
         <ul id="peer-list" class="list"></ul>
         <p id="peer-empty" class="empty-hint">同じネットワーク上に他のPCが見つかりません。</p>
       </section>
+
+      <section>
+        <h2>共有キー</h2>
+        <p class="subtitle">
+          通知を送り合いたいPC同士で、同じ値を設定してください(Wi-Fiのパスワードのようなものです)。値が一致しない相手とは通知が届きません。変更後はアプリの再起動が必要です。
+        </p>
+        <div class="key-row">
+          <input id="shared-secret-input" type="text" spellcheck="false" autocomplete="off" />
+          <button id="save-secret-btn">保存</button>
+        </div>
+        <p id="secret-saved-hint" class="empty-hint" hidden>保存しました。反映には再起動が必要です。</p>
+      </section>
     </main>
     <script type="module" src="main.js"></script>
   </body>

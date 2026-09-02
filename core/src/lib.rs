@@ -6,11 +6,15 @@
 //! notifications.
 
 pub mod discovery;
+pub mod exclude;
 pub mod peer;
 pub mod protocol;
+pub mod reconcile;
 pub mod watcher;
 
 pub use discovery::start as start_discovery;
+pub use exclude::ExcludeRules;
 pub use peer::{broadcast, run_peer_server, PeerHandle, PeerRegistry};
-pub use protocol::{ChangeKind, ChangeMessage, DEFAULT_PORT};
+pub use protocol::{ChangeKind, ChangeMessage, SharedSecret, DEFAULT_PORT};
+pub use reconcile::ManifestStore;
 pub use watcher::{ChangeEvent, FolderWatcher};

@@ -8,7 +8,7 @@ mod state;
 mod watch;
 
 use config::{config_path, Config};
-use lfsync_core::{run_peer_server, ChangeMessage, PeerRegistry, DEFAULT_PORT};
+use lfsync_core::{run_peer_server, ChangeMessage, PeerRegistry, SharedSecret, DEFAULT_PORT};
 use state::AppState;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -46,22 +46,31 @@ fn main() {
             commands::remove_watched_folder,
             commands::get_peers,
             commands::pick_folder,
+            commands::get_shared_secret,
+            commands::set_shared_secret,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
-            let peer_id = app
-                .state::<AppState>()
-                .config
-                .lock()
-                .unwrap()
-                .peer_id
-                .clone();
+            let (peer_id, shared_secret) = {
+                let state = app.state::<AppState>();
+                let config = state.config.lock().unwrap();
+                (
+                    config.peer_id.clone(),
+                    SharedSecret::new(&config.shared_secret),
+                )
+            };
             let hostname_for_discovery = hostname.clone();
             let registry_for_task = peer_registry.clone();
 
             tauri::async_runtime::spawn(async move {
-                run_agent_networking(handle, peer_id, hostname_for_discovery, registry_for_task)
-                    .await;
+                run_agent_networking(
+                    handle,
+                    peer_id,
+                    hostname_for_discovery,
+                    registry_for_task,
+                    shared_secret,
+                )
+                .await;
             });
 
             let folders = app
@@ -95,16 +104,22 @@ fn main() {
 
 /// Binds the peer TCP server, starts mDNS discovery/advertisement, and shows a toast for
 /// every change received from a peer. Runs for the lifetime of the app.
+///
+/// `shared_secret` is captured once at startup: if the user changes it later via the
+/// settings window, this server keeps validating incoming messages against the old value
+/// (and outgoing broadcasts pick up the new one immediately) until the app restarts. A
+/// mismatch here just means peers stop hearing from each other, not a security hole.
 async fn run_agent_networking(
     app: tauri::AppHandle,
     peer_id: String,
     hostname: String,
     registry: PeerRegistry,
+    shared_secret: SharedSecret,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChangeMessage>();
 
     let default_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_PORT);
-    let local_addr = match run_peer_server(default_addr, tx.clone()).await {
+    let local_addr = match run_peer_server(default_addr, shared_secret.clone(), tx.clone()).await {
         Ok((addr, _handle)) => addr,
         Err(err) => {
             tracing::warn!(
@@ -112,7 +127,7 @@ async fn run_agent_networking(
                 "default port unavailable, binding a random port instead"
             );
             let random_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-            match run_peer_server(random_addr, tx).await {
+            match run_peer_server(random_addr, shared_secret, tx).await {
                 Ok((addr, _handle)) => addr,
                 Err(err) => {
                     tracing::error!(?err, "failed to start peer server; LAN sync is disabled");

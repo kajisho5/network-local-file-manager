@@ -72,3 +72,21 @@ pub fn remove_watched_folder(state: State<AppState>, path: String) -> Result<(),
     state.watchers.lock().unwrap().remove(&path);
     Ok(())
 }
+
+#[tauri::command]
+pub fn get_shared_secret(state: State<AppState>) -> String {
+    state.config.lock().unwrap().shared_secret.clone()
+}
+
+/// Sets the shared secret used to authenticate peers (the same value must be set on
+/// every machine that should talk to this one). Takes effect immediately for outgoing
+/// broadcasts; the peer server already listening keeps validating incoming connections
+/// against the secret it started with until the app restarts.
+#[tauri::command]
+pub fn set_shared_secret(state: State<AppState>, secret: String) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.shared_secret = secret;
+    config
+        .save(&state.config_path)
+        .map_err(|err| err.to_string())
+}

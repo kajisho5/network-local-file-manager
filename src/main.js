@@ -6,6 +6,9 @@ const peerList = document.getElementById("peer-list");
 const peerEmpty = document.getElementById("peer-empty");
 const peerCount = document.getElementById("peer-count");
 const addFolderBtn = document.getElementById("add-folder-btn");
+const sharedSecretInput = document.getElementById("shared-secret-input");
+const saveSecretBtn = document.getElementById("save-secret-btn");
+const secretSavedHint = document.getElementById("secret-saved-hint");
 
 async function refreshFolders() {
   const folders = await invoke("get_watched_folders");
@@ -61,6 +64,21 @@ addFolderBtn.addEventListener("click", async () => {
   await refreshFolders();
 });
 
+async function loadSharedSecret() {
+  sharedSecretInput.value = await invoke("get_shared_secret");
+}
+
+saveSecretBtn.addEventListener("click", async () => {
+  const secret = sharedSecretInput.value.trim();
+  if (!secret) return;
+  await invoke("set_shared_secret", { secret });
+  secretSavedHint.hidden = false;
+  setTimeout(() => {
+    secretSavedHint.hidden = true;
+  }, 4000);
+});
+
 refreshFolders();
 refreshPeers();
+loadSharedSecret();
 setInterval(refreshPeers, 3000);
