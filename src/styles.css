@@ -1,0 +1,130 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --fg: #1a1c20;
+  --muted: #6b7280;
+  --card: #ffffff;
+  --border: #e2e4e9;
+  --accent: #2b59c7;
+  --accent-fg: #ffffff;
+  --danger: #c73a3a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #17181c;
+    --fg: #eef0f4;
+    --muted: #9aa0ac;
+    --card: #202227;
+    --border: #33353b;
+    --accent: #6d93f5;
+    --accent-fg: #0d1220;
+    --danger: #e57373;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic", sans-serif;
+}
+
+main {
+  max-width: 440px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+h1 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.subtitle {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+  margin: 0 0 20px;
+}
+
+section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+h2 {
+  font-size: 14px;
+  margin: 0 0 10px;
+}
+
+button {
+  font-size: 12.5px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-fg);
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.05);
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+  padding: 3px 9px;
+  font-size: 11.5px;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.list li:last-child {
+  border-bottom: none;
+}
+
+.list .path,
+.list .peer-name {
+  overflow-wrap: anywhere;
+}
+
+.list .peer-addr {
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.empty-hint {
+  color: var(--muted);
+  font-size: 12.5px;
+  margin: 4px 0 0;
+}

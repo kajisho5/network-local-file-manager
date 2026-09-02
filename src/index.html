@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>network-local-file-manager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <h1>network-local-file-manager</h1>
+      <p class="subtitle">監視中のフォルダに変更があると、このPCと同じネットワーク上の他のPCにトースト通知します。</p>
+
+      <section>
+        <div class="section-header">
+          <h2>監視フォルダ</h2>
+          <button id="add-folder-btn">フォルダを追加</button>
+        </div>
+        <ul id="folder-list" class="list"></ul>
+        <p id="folder-empty" class="empty-hint" hidden>まだフォルダが登録されていません。</p>
+      </section>
+
+      <section>
+        <h2>LAN上のPC (<span id="peer-count">0</span>)</h2>
+        <ul id="peer-list" class="list"></ul>
+        <p id="peer-empty" class="empty-hint">同じネットワーク上に他のPCが見つかりません。</p>
+      </section>
+    </main>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>
