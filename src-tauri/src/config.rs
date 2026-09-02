@@ -90,35 +90,43 @@ impl Config {
     }
 }
 
-pub fn config_path() -> PathBuf {
+/// Where every piece of this app's persisted state lives.
+///
+/// Normally the OS config directory, but overridable via `LFSYNC_CONFIG_DIR` so multiple
+/// independent "machines" can be run side by side on one real PC — each with its own
+/// identity, watched folders, and shared secret — to test LAN discovery and peer-to-peer
+/// delivery without needing a second physical device:
+///
+/// ```sh
+/// LFSYNC_CONFIG_DIR=/tmp/lfsync-a ./network-local-file-manager
+/// LFSYNC_CONFIG_DIR=/tmp/lfsync-b ./network-local-file-manager
+/// ```
+fn base_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("LFSYNC_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
     dirs::config_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("network-local-file-manager")
-        .join("config.json")
+}
+
+pub fn config_path() -> PathBuf {
+    base_dir().join("config.json")
 }
 
 /// Directory where per-folder reconciliation manifests are kept (see [`lfsync_core::ManifestStore`]).
 pub fn manifests_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("network-local-file-manager")
-        .join("manifests")
+    base_dir().join("manifests")
 }
 
 /// Directory where per-peer outbound message queues are kept (see [`lfsync_core::Outbox`]).
 pub fn outbox_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("network-local-file-manager")
-        .join("outbox")
+    base_dir().join("outbox")
 }
 
 /// File tracking every peer ever discovered on the LAN (see [`lfsync_core::Roster`]).
 pub fn roster_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("network-local-file-manager")
-        .join("roster.json")
+    base_dir().join("roster.json")
 }
 
 #[cfg(test)]
